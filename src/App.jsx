@@ -290,11 +290,18 @@ async function recoverPassword(email) {
 }
 
 async function refreshSession(refreshToken) {
-  const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY },
-    body: JSON.stringify({ refresh_token: refreshToken }),
-  });
+  let res;
+  try {
+    res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    });
+  } catch {
+    const err = new Error("Нет соединения");
+    err.isNetworkError = true;
+    throw err;
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.msg || data.error_description || "Не удалось продлить сессию");
   return data;
@@ -459,7 +466,15 @@ export default function DAlbom() {
         setSession(data);
         saveSession(data);
       })
-      .catch(() => clearStoredSession())
+      .catch((e) => {
+        if (e.isNetworkError) {
+          // no connection right now — the saved login is probably still fine,
+          // don't throw it away just because we couldn't check
+          setSession(stored);
+        } else {
+          clearStoredSession();
+        }
+      })
       .finally(() => setRestoringSession(false));
   }, []);
 
