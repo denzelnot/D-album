@@ -10,6 +10,8 @@ import {
   FileWarning,
   RefreshCw,
   LogOut,
+  WifiOff,
+  CloudOff,
 } from "lucide-react";
 
 const SUPABASE_URL = "https://nynaypkgnnccjroypvyu.supabase.co";
@@ -38,6 +40,83 @@ function readAsDataURL(file) {
 function extLabel(name) {
   const m = name.match(/\.([a-zA-Z0-9]+)$/);
   return m ? m[1].toUpperCase() : "ФОТО";
+}
+
+// ---------- Offline storage (IndexedDB) ----------
+// "photoCache": last-known copy of the album, so it opens instantly and works
+// with no signal. "pendingUploads": photos added while offline, sent for real
+// once the connection comes back.
+const DB_NAME = "dalbum-offline";
+const DB_VERSION = 1;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains("photoCache")) db.createObjectStore("photoCache", { keyPath: "id" });
+      if (!db.objectStoreNames.contains("pendingUploads")) db.createObjectStore("pendingUploads", { keyPath: "id" });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbPut(storeName, value) {
+  try {
+    const db = await openDB();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, "readwrite");
+      tx.objectStore(storeName).put(value);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // offline storage is a nice-to-have — never let it break the app
+  }
+}
+
+async function idbGetAll(storeName) {
+  try {
+    const db = await openDB();
+    return await new Promise((resolve, reject) => {
+      const req = db.transaction(storeName, "readonly").objectStore(storeName).getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    return [];
+  }
+}
+
+async function idbDelete(storeName, id) {
+  try {
+    const db = await openDB();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, "readwrite");
+      tx.objectStore(storeName).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // ignore
+  }
+}
+
+async function idbClearAndFill(storeName, values) {
+  try {
+    const db = await openDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, "readwrite");
+      const store = tx.objectStore(storeName);
+      store.clear();
+      for (const v of values) store.put(v);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // ignore
+  }
 }
 
 // ---------- Minimal manual EXIF reader (no external libraries) ----------
@@ -210,6 +289,41 @@ async function recoverPassword(email) {
   }
 }
 
+async function refreshSession(refreshToken) {
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", apikey: SUPABASE_ANON_KEY },
+    body: JSON.stringify({ refresh_token: refreshToken }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.msg || data.error_description || "Не удалось продлить сессию");
+  return data;
+}
+
+const SESSION_KEY = "dalbum-session";
+function saveSession(data) {
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify(data));
+  } catch {
+    // storage unavailable (private browsing etc.) — session just won't persist
+  }
+}
+function loadStoredSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+function clearStoredSession() {
+  try {
+    localStorage.removeItem(SESSION_KEY);
+  } catch {
+    // ignore
+  }
+}
+
 async function uploadToStorage(accessToken, path, file) {
   const res = await fetch(`${SUPABASE_URL}/storage/v1/object/photos/${encodeURIComponent(path)}`, {
     method: "POST",
@@ -309,46 +423,198 @@ export default function DAlbom() {
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
   const [resetSent, setResetSent] = useState(false);
+  const [restoringSession, setRestoringSession] = useState(true);
 
   const [photos, setPhotos] = useState([]);
   const [dragOver, setDragOver] = useState(false);
   const [lightboxId, setLightboxId] = useState(null);
   const [loadingPhotos, setLoadingPhotos] = useState(false);
   const [uploadError, setUploadError] = useState("");
+  const [isOnline, setIsOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
+  const [pendingCount, setPendingCount] = useState(0);
+  const [syncing, setSyncing] = useState(false);
+  const [viewFilter, setViewFilter] = useState("all");
+
+  useEffect(() => {
+    const goOnline = () => setIsOnline(true);
+    const goOffline = () => setIsOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => {
+      window.removeEventListener("online", goOnline);
+      window.removeEventListener("offline", goOffline);
+    };
+  }, []);
+
+  // Restore a saved login on launch, and keep it refreshed automatically —
+  // signing out now only happens if you tap "Выйти".
+  useEffect(() => {
+    const stored = loadStoredSession();
+    if (!stored?.refresh_token) {
+      setRestoringSession(false);
+      return;
+    }
+    refreshSession(stored.refresh_token)
+      .then((data) => {
+        setSession(data);
+        saveSession(data);
+      })
+      .catch(() => clearStoredSession())
+      .finally(() => setRestoringSession(false));
+  }, []);
+
+  useEffect(() => {
+    if (!session?.refresh_token) return;
+    const id = setInterval(() => {
+      refreshSession(session.refresh_token)
+        .then((data) => {
+          setSession(data);
+          saveSession(data);
+        })
+        .catch(() => {});
+    }, 50 * 60 * 1000); // refresh well before the ~1h token expiry
+    return () => clearInterval(id);
+  }, [session]);
 
   const myId = session?.user?.id;
   const myLabel = session?.user?.email || "";
 
-  const loadPhotos = useCallback(async (accessToken) => {
-    setLoadingPhotos(true);
-    try {
-      const rows = await fetchPhotoRows(accessToken);
-      const urlMap = await signPaths(accessToken, rows.map((r) => r.file_path));
-      const loaded = rows.map((r) => ({
-        id: r.id,
-        url: urlMap[r.file_path] || null,
-        filePath: r.file_path,
-        name: r.file_path.split("/").pop(),
-        takenAt: new Date(r.taken_at || r.uploaded_at),
-        hasExifDate: !!r.taken_at,
-        lat: r.lat,
-        lng: r.lng,
-        uploadedBy: r.uploaded_by,
-        ownerId: r.owner_id,
-        previewFailed: !urlMap[r.file_path],
-        remote: true,
-      }));
-      setPhotos(loaded);
-    } catch (e) {
-      setUploadError(e.message);
-    } finally {
-      setLoadingPhotos(false);
+  const loadFromCache = useCallback(async () => {
+    const cached = await idbGetAll("photoCache");
+    const pending = await idbGetAll("pendingUploads");
+    const cachedPhotos = cached.map((c) => ({ ...c, takenAt: new Date(c.takenAt), remote: true }));
+    const pendingPhotos = pending.map((p) => ({
+      id: p.id,
+      url: p.dataUrl,
+      name: p.name,
+      takenAt: new Date(p.takenAt),
+      hasExifDate: p.hasExifDate,
+      lat: p.lat,
+      lng: p.lng,
+      uploadedBy: p.uploadedBy,
+      ownerId: p.ownerId,
+      previewFailed: !p.dataUrl,
+      pending: true,
+    }));
+    setPhotos([...pendingPhotos, ...cachedPhotos]);
+    setPendingCount(pending.length);
+  }, []);
+
+  const cacheRemotePhotos = useCallback(async (loaded) => {
+    const loadedIds = new Set(loaded.map((p) => p.id));
+    const existingCache = await idbGetAll("photoCache");
+    for (const c of existingCache) if (!loadedIds.has(c.id)) idbDelete("photoCache", c.id);
+    for (const p of loaded) {
+      if (!p.url) continue;
+      try {
+        const res = await fetch(p.url);
+        const blob = await res.blob();
+        const dataUrl = await readAsDataURL(blob);
+        idbPut("photoCache", {
+          id: p.id,
+          dataUrl,
+          filePath: p.filePath,
+          name: p.name,
+          takenAt: p.takenAt.toISOString(),
+          hasExifDate: p.hasExifDate,
+          lat: p.lat,
+          lng: p.lng,
+          uploadedBy: p.uploadedBy,
+          ownerId: p.ownerId,
+        });
+      } catch {
+        // this one just won't be viewable offline until the next successful sync
+      }
     }
   }, []);
+
+  const loadPhotos = useCallback(
+    async (accessToken) => {
+      setLoadingPhotos(true);
+      try {
+        const rows = await fetchPhotoRows(accessToken);
+        const urlMap = await signPaths(accessToken, rows.map((r) => r.file_path));
+        const loaded = rows.map((r) => ({
+          id: r.id,
+          url: urlMap[r.file_path] || null,
+          filePath: r.file_path,
+          name: r.file_path.split("/").pop(),
+          takenAt: new Date(r.taken_at || r.uploaded_at),
+          hasExifDate: !!r.taken_at,
+          lat: r.lat,
+          lng: r.lng,
+          uploadedBy: r.uploaded_by,
+          ownerId: r.owner_id,
+          previewFailed: !urlMap[r.file_path],
+          remote: true,
+        }));
+        const pending = await idbGetAll("pendingUploads");
+        const pendingPhotos = pending.map((p) => ({
+          id: p.id,
+          url: p.dataUrl,
+          name: p.name,
+          takenAt: new Date(p.takenAt),
+          hasExifDate: p.hasExifDate,
+          lat: p.lat,
+          lng: p.lng,
+          uploadedBy: p.uploadedBy,
+          ownerId: p.ownerId,
+          previewFailed: !p.dataUrl,
+          pending: true,
+        }));
+        setPhotos([...pendingPhotos, ...loaded]);
+        setPendingCount(pending.length);
+        cacheRemotePhotos(loaded);
+      } catch (e) {
+        await loadFromCache();
+        if (isOnline) setUploadError(e.message);
+      } finally {
+        setLoadingPhotos(false);
+      }
+    },
+    [cacheRemotePhotos, loadFromCache, isOnline]
+  );
+
+  const syncPendingUploads = useCallback(async () => {
+    if (!session?.access_token) return;
+    const pending = await idbGetAll("pendingUploads");
+    if (pending.length === 0) return;
+    setSyncing(true);
+    for (const item of pending) {
+      try {
+        const blobRes = await fetch(item.dataUrl);
+        const blob = await blobRes.blob();
+        const safeName = item.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+        const path = `${item.ownerId}/${item.uploadedAt}-${safeName}`;
+        await uploadToStorage(session.access_token, path, blob);
+        const row = await insertPhotoRow(session.access_token, {
+          uploaded_by: item.uploadedBy,
+          owner_id: item.ownerId,
+          file_path: path,
+          taken_at: item.takenAt,
+          lat: item.lat,
+          lng: item.lng,
+        });
+        await idbDelete("pendingUploads", item.id);
+        setPhotos((prev) =>
+          prev.map((p) => (p.id === item.id ? { ...p, id: row.id, filePath: path, pending: false, remote: true } : p))
+        );
+      } catch {
+        // stays in the queue — we'll retry on the next reconnect
+      }
+    }
+    setSyncing(false);
+    const remaining = await idbGetAll("pendingUploads");
+    setPendingCount(remaining.length);
+  }, [session]);
 
   useEffect(() => {
     if (session?.access_token) loadPhotos(session.access_token);
   }, [session, loadPhotos]);
+
+  useEffect(() => {
+    if (isOnline && session?.access_token) syncPendingUploads();
+  }, [isOnline, session, syncPendingUploads]);
 
   const handleAuthSubmit = async () => {
     setAuthError("");
@@ -358,6 +624,7 @@ export default function DAlbom() {
         const data = await signUp(email.trim(), password);
         if (data.access_token) {
           setSession(data);
+          saveSession(data);
         } else {
           setAuthError("Проверьте почту — нужно подтвердить регистрацию по ссылке из письма, затем войдите.");
           setAuthMode("login");
@@ -365,6 +632,7 @@ export default function DAlbom() {
       } else {
         const data = await signIn(email.trim(), password);
         setSession(data);
+        saveSession(data);
       }
     } catch (e) {
       setAuthError(e.message);
@@ -406,6 +674,41 @@ export default function DAlbom() {
         }
         const takenAt = exif?.takenAt || new Date(file.lastModified);
         const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+        if (!isOnline) {
+          const queued = {
+            id: tempId,
+            dataUrl: localUrl,
+            name: file.name,
+            takenAt: takenAt.toISOString(),
+            uploadedAt: Date.now(),
+            hasExifDate: !!exif?.takenAt,
+            lat: exif?.lat ?? null,
+            lng: exif?.lng ?? null,
+            uploadedBy: myLabel,
+            ownerId: myId,
+          };
+          await idbPut("pendingUploads", queued);
+          setPendingCount((n) => n + 1);
+          setPhotos((prev) => [
+            {
+              id: tempId,
+              url: localUrl,
+              name: file.name,
+              takenAt,
+              hasExifDate: !!exif?.takenAt,
+              lat: exif?.lat ?? null,
+              lng: exif?.lng ?? null,
+              uploadedBy: myLabel,
+              ownerId: myId,
+              previewFailed: !localUrl,
+              pending: true,
+            },
+            ...prev,
+          ]);
+          continue;
+        }
+
         const optimistic = {
           id: tempId,
           url: localUrl,
@@ -442,7 +745,7 @@ export default function DAlbom() {
         }
       }
     },
-    [myId, myLabel, session]
+    [myId, myLabel, session, isOnline]
   );
 
   const onDrop = (e) => {
@@ -453,11 +756,22 @@ export default function DAlbom() {
 
   const removePhoto = async (id) => {
     const photo = photos.find((p) => p.id === id);
+    if (photo?.pending) {
+      setPhotos((prev) => prev.filter((p) => p.id !== id));
+      await idbDelete("pendingUploads", id);
+      setPendingCount((n) => Math.max(0, n - 1));
+      return;
+    }
+    if (!isOnline) {
+      setUploadError("Без интернета можно удалять только ещё не отправленные фото");
+      return;
+    }
     setPhotos((prev) => prev.filter((p) => p.id !== id));
     if (!photo?.remote || !session?.access_token) return;
     try {
       await deletePhotoRow(session.access_token, id);
       if (photo.filePath) deleteStorageObject(session.access_token, photo.filePath);
+      idbDelete("photoCache", id);
     } catch (e) {
       setUploadError(e.message);
       setPhotos((prev) => [...prev, photo]);
@@ -467,8 +781,18 @@ export default function DAlbom() {
   const markPreviewFailed = (id) =>
     setPhotos((prev) => prev.map((p) => (p.id === id ? { ...p, previewFailed: true } : p)));
 
+  const displayName = (emailAddr) => {
+    if (!emailAddr) return "";
+    const name = emailAddr.split("@")[0];
+    return name.charAt(0).toUpperCase() + name.slice(1);
+  };
+
+  const knownMembers = [...new Set(photos.map((p) => p.uploadedBy).filter(Boolean))].sort();
+
+  const visiblePhotos = viewFilter === "all" ? photos : photos.filter((p) => p.uploadedBy === viewFilter);
+
   const groups = {};
-  for (const photo of photos) {
+  for (const photo of visiblePhotos) {
     const key = dayKey(photo.takenAt);
     if (!groups[key]) groups[key] = [];
     groups[key].push(photo);
@@ -509,6 +833,15 @@ export default function DAlbom() {
       .dalb-btn:disabled { opacity: 0.5; cursor: default; }
     `}</style>
   );
+
+  if (restoringSession) {
+    return (
+      <div style={styles.authRoot}>
+        {fontImports}
+        <RefreshCw size={20} color="#c9a4fb" className="dalb-spin" />
+      </div>
+    );
+  }
 
   if (!session) {
     return (
@@ -582,6 +915,22 @@ export default function DAlbom() {
           <h1 style={styles.title}>D-Album</h1>
         </div>
         <div style={styles.memberPicker}>
+          <span
+            style={{
+              ...styles.memberPill,
+              borderColor: isOnline ? "#3d2f49" : "#ff6fb5",
+              color: isOnline ? "#8fe0a8" : "#ff9ecb",
+              cursor: "default",
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+            }}
+          >
+            {isOnline ? (syncing ? "Синхронизация..." : "Онлайн") : <><WifiOff size={12} strokeWidth={2} /> Офлайн</>}
+            {pendingCount > 0 && (
+              <span style={styles.pendingBadge}>{pendingCount}</span>
+            )}
+          </span>
           <span style={{ ...styles.memberPill, borderColor: colorForName(myLabel), color: "#c9bdd2", cursor: "default" }}>
             Вы: {myLabel}
           </span>
@@ -593,7 +942,7 @@ export default function DAlbom() {
           >
             <RefreshCw size={14} className={loadingPhotos ? "dalb-spin" : ""} />
           </button>
-          <button className="dalb-pill" onClick={() => setSession(null)} style={styles.iconBtn} title="Выйти">
+          <button className="dalb-pill" onClick={() => { setSession(null); clearStoredSession(); }} style={styles.iconBtn} title="Выйти">
             <LogOut size={14} />
           </button>
         </div>
@@ -610,12 +959,50 @@ export default function DAlbom() {
         <div style={styles.uploadIcon}><Upload size={18} color="#1a1420" strokeWidth={2} /></div>
         <div>
           <div style={styles.dropTitle}>Перетащите фото сюда или нажмите, чтобы выбрать</div>
-          <div style={styles.dropSub}>Загружается в общее облако — увидят все члены семьи</div>
+          <div style={styles.dropSub}>
+            {isOnline
+              ? "Загружается в общее облако — увидят все члены семьи"
+              : "Нет связи — фото сохранится на телефоне и отправится само, когда появится интернет"}
+          </div>
         </div>
       </label>
 
       {uploadError && (
         <div style={styles.errorBanner} onClick={() => setUploadError("")}>{uploadError} (нажмите, чтобы скрыть)</div>
+      )}
+
+      {knownMembers.length > 1 && (
+        <div style={styles.filterRow}>
+          <button
+            className="dalb-pill"
+            onClick={() => setViewFilter("all")}
+            style={{
+              ...styles.memberPill,
+              borderColor: viewFilter === "all" ? "#c084fc" : "#3d2f49",
+              color: viewFilter === "all" ? "#1a1420" : "#c9bdd2",
+              background: viewFilter === "all" ? "#c084fc" : "transparent",
+              fontWeight: viewFilter === "all" ? 700 : 500,
+            }}
+          >
+            Общий альбом
+          </button>
+          {knownMembers.map((m) => (
+            <button
+              key={m}
+              className="dalb-pill"
+              onClick={() => setViewFilter(m)}
+              style={{
+                ...styles.memberPill,
+                borderColor: viewFilter === m ? colorForName(m) : "#3d2f49",
+                color: viewFilter === m ? "#1a1420" : "#c9bdd2",
+                background: viewFilter === m ? colorForName(m) : "transparent",
+                fontWeight: viewFilter === m ? 700 : 500,
+              }}
+            >
+              {m === myLabel ? "Мои фото" : displayName(m)}
+            </button>
+          ))}
+        </div>
       )}
 
       <div className="dalb-scroll" style={styles.body}>
@@ -653,7 +1040,14 @@ export default function DAlbom() {
                             <X size={13} strokeWidth={2.5} />
                           </button>
                         )}
-                        <div style={{ ...styles.avatarDot, background: colorForName(photo.uploadedBy || "") }} title={photo.uploadedBy} />
+                        {photo.pending && (
+                          <div style={styles.pendingChip} title="Офлайн — отправится, когда будет интернет">
+                            <CloudOff size={11} strokeWidth={2} /> ждёт отправки
+                          </div>
+                        )}
+                        <div style={{ ...styles.avatarChip, background: colorForName(photo.uploadedBy || "") }} title={photo.uploadedBy}>
+                          {displayName(photo.uploadedBy)}
+                        </div>
                       </div>
                     );
                   })}
@@ -686,7 +1080,7 @@ export default function DAlbom() {
               )}
               <span style={styles.lightboxUploader}>
                 <span style={{ ...styles.avatarDotInline, background: colorForName(lightboxPhoto.uploadedBy || "") }} />
-                {lightboxPhoto.uploadedBy}
+                {lightboxPhoto.uploadedBy === myLabel ? "Вы" : displayName(lightboxPhoto.uploadedBy)}
               </span>
               {lightboxPhoto.ownerId === myId && (
                 <button
@@ -734,8 +1128,12 @@ const styles = {
   dayHeaderDate: { fontFamily: "'Fraunces', serif", fontSize: 17, fontWeight: 600, letterSpacing: "0.01em" },
   dayHeaderPlace: { display: "flex", alignItems: "center", gap: 4, fontFamily: "'JetBrains Mono', monospace", fontSize: 11.5, color: "#e9b8ff", background: "rgba(192,132,252,0.12)", padding: "3px 9px", borderRadius: 999 },
   noExifTag: { fontSize: 11, color: "#6b5c78", fontFamily: "'JetBrains Mono', monospace", marginLeft: "auto" },
+  filterRow: { position: "relative", zIndex: 1, display: "flex", gap: 6, flexWrap: "wrap" },
   avatarDot: { position: "absolute", bottom: 6, left: 6, width: 10, height: 10, borderRadius: "50%", border: "1.5px solid rgba(26,20,32,0.85)" },
+  avatarChip: { position: "absolute", bottom: 6, left: 6, fontSize: 10, fontWeight: 700, color: "#1a1420", padding: "2px 8px", borderRadius: 999, maxWidth: "70%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
   avatarDotInline: { display: "inline-block", width: 8, height: 8, borderRadius: "50%", marginRight: 6 },
+  pendingBadge: { background: "#ff6fb5", color: "#1a1420", fontSize: 10, fontWeight: 700, borderRadius: 999, padding: "1px 6px", lineHeight: 1.4 },
+  pendingChip: { position: "absolute", top: 6, left: 6, display: "flex", alignItems: "center", gap: 4, fontSize: 9.5, fontFamily: "'JetBrains Mono', monospace", color: "#1a1420", background: "rgba(255,158,203,0.92)", padding: "2px 7px", borderRadius: 999 },
   fallback: { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8, padding: 14, background: "linear-gradient(160deg, #2f2438, #251c2e)" },
   fallbackIcon: { width: 40, height: 40, borderRadius: 10, background: "linear-gradient(135deg, #ff9ecb, #c9a4fb)", display: "flex", alignItems: "center", justifyContent: "center" },
   fallbackName: { color: "#c9bdd2", textAlign: "center", wordBreak: "break-word", lineHeight: 1.3 },
