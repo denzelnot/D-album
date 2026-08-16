@@ -1,6 +1,6 @@
 {
-  "name": "D-Albom",
-  "short_name": "D-Albom",
+  "name": "D-Album",
+  "short_name": "D-Album",
   "description": "Семейный фотоальбом",
   "start_url": "/",
   "display": "standalone",

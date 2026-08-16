@@ -519,7 +519,7 @@ export default function DAlbom() {
         <div style={styles.authCard}>
           <div style={styles.logoRow}>
             <div style={styles.logoMark}><Sparkles size={16} color="#1a1420" strokeWidth={2.5} /></div>
-            <h1 style={styles.title}>D-Albom</h1>
+            <h1 style={styles.title}>D-Album</h1>
           </div>
           <p style={{ color: "#a698b0", fontSize: 13.5, margin: "4px 0 4px" }}>
             Семейный альбом. {authMode === "signup" ? "Создайте аккаунт." : "Войдите по почте и паролю."}
@@ -579,7 +579,7 @@ export default function DAlbom() {
       <header style={styles.header}>
         <div style={styles.logoRow}>
           <div style={styles.logoMark}><Sparkles size={16} color="#1a1420" strokeWidth={2.5} /></div>
-          <h1 style={styles.title}>D-Albom</h1>
+          <h1 style={styles.title}>D-Album</h1>
         </div>
         <div style={styles.memberPicker}>
           <span style={{ ...styles.memberPill, borderColor: colorForName(myLabel), color: "#c9bdd2", cursor: "default" }}>
