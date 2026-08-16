@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import {
   Image as ImageIcon,
   MapPin,
@@ -754,6 +754,24 @@ export default function DAlbom() {
     handleFiles(e.dataTransfer.files);
   };
 
+  // iOS Safari, when the app is installed as a home-screen PWA, sometimes
+  // doesn't deliver React's synthetic onChange the first time the native
+  // photo picker closes — the files silently vanish until a second try.
+  // Binding directly to the DOM node's own change event is more reliable
+  // there. We also reset the input's value after every use so picking the
+  // exact same photos again still fires a change event next time.
+  const fileInputRef = useRef(null);
+  useEffect(() => {
+    const input = fileInputRef.current;
+    if (!input) return;
+    const onChange = (e) => {
+      handleFiles(e.target.files);
+      e.target.value = "";
+    };
+    input.addEventListener("change", onChange);
+    return () => input.removeEventListener("change", onChange);
+  }, [handleFiles]);
+
   const removePhoto = async (id) => {
     const photo = photos.find((p) => p.id === id);
     if (photo?.pending) {
@@ -955,7 +973,14 @@ export default function DAlbom() {
         onDragLeave={() => setDragOver(false)}
         onDrop={onDrop}
       >
-        <input type="file" accept="image/*,.heic,.heif" multiple onChange={(e) => handleFiles(e.target.files)} style={{ position: "absolute", width: 1, height: 1, opacity: 0 }} />
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*,.heic,.heif"
+          multiple
+          onClick={(e) => { e.target.value = ""; }}
+          style={{ position: "absolute", width: 1, height: 1, opacity: 0 }}
+        />
         <div style={styles.uploadIcon}><Upload size={18} color="#1a1420" strokeWidth={2} /></div>
         <div>
           <div style={styles.dropTitle}>Перетащите фото сюда или нажмите, чтобы выбрать</div>
