@@ -42,6 +42,44 @@ function extLabel(name) {
   return m ? m[1].toUpperCase() : "ФОТО";
 }
 
+// Large phone-camera originals (and especially "download original" files from
+// Google Photos) can be 10-20+ MB — decoding, base64-encoding and uploading
+// that full-size on a low-RAM phone is exactly what triggers "not enough
+// memory" errors. We downscale to a sensible viewing size first; EXIF is
+// always read from the true original before this runs, so the date/location
+// aren't affected. Falls back to the original file untouched if the browser
+// can't decode it (e.g. HEIC) or anything goes wrong.
+function resizeImage(file, maxDim = 1600, quality = 0.82) {
+  return new Promise((resolve, reject) => {
+    const objectUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      let { width, height } = img;
+      if (width > maxDim || height > maxDim) {
+        if (width > height) {
+          height = Math.round((height * maxDim) / width);
+          width = maxDim;
+        } else {
+          width = Math.round((width * maxDim) / height);
+          height = maxDim;
+        }
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0, width, height);
+      URL.revokeObjectURL(objectUrl);
+      canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error("no blob"))), "image/jpeg", quality);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error("decode failed"));
+    };
+    img.src = objectUrl;
+  });
+}
+
 // ---------- Offline storage (IndexedDB) ----------
 // "photoCache": last-known copy of the album, so it opens instantly and works
 // with no signal. "pendingUploads": photos added while offline, sent for real
@@ -674,12 +712,6 @@ export default function DAlbom() {
       if (!session?.access_token) return;
       const files = Array.from(fileList).filter((f) => f.type.startsWith("image/") || IMAGE_EXT_RE.test(f.name));
       for (const file of files) {
-        let localUrl = null;
-        try {
-          localUrl = await readAsDataURL(file);
-        } catch {
-          localUrl = null;
-        }
         let exif = null;
         try {
           const buffer = await file.arrayBuffer();
@@ -687,6 +719,25 @@ export default function DAlbom() {
         } catch {
           exif = null;
         }
+
+        let uploadBlob = file;
+        let uploadName = file.name;
+        try {
+          uploadBlob = await resizeImage(file);
+          uploadName = file.name.replace(/\.[a-zA-Z0-9]+$/, "") + ".jpg";
+        } catch {
+          // couldn't decode/resize (e.g. HEIC) — fall back to the original file as-is
+          uploadBlob = file;
+          uploadName = file.name;
+        }
+
+        let localUrl = null;
+        try {
+          localUrl = await readAsDataURL(uploadBlob);
+        } catch {
+          localUrl = null;
+        }
+
         const takenAt = exif?.takenAt || new Date(file.lastModified);
         const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
@@ -694,7 +745,7 @@ export default function DAlbom() {
           const queued = {
             id: tempId,
             dataUrl: localUrl,
-            name: file.name,
+            name: uploadName,
             takenAt: takenAt.toISOString(),
             uploadedAt: Date.now(),
             hasExifDate: !!exif?.takenAt,
@@ -709,7 +760,7 @@ export default function DAlbom() {
             {
               id: tempId,
               url: localUrl,
-              name: file.name,
+              name: uploadName,
               takenAt,
               hasExifDate: !!exif?.takenAt,
               lat: exif?.lat ?? null,
@@ -727,7 +778,7 @@ export default function DAlbom() {
         const optimistic = {
           id: tempId,
           url: localUrl,
-          name: file.name,
+          name: uploadName,
           takenAt,
           hasExifDate: !!exif?.takenAt,
           lat: exif?.lat ?? null,
@@ -740,9 +791,9 @@ export default function DAlbom() {
         setPhotos((prev) => [optimistic, ...prev]);
 
         try {
-          const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+          const safeName = uploadName.replace(/[^a-zA-Z0-9._-]/g, "_");
           const path = `${myId}/${Date.now()}-${safeName}`;
-          await uploadToStorage(session.access_token, path, file);
+          await uploadToStorage(session.access_token, path, uploadBlob);
           const row = await insertPhotoRow(session.access_token, {
             uploaded_by: myLabel,
             owner_id: myId,
