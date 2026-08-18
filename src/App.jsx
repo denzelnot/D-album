@@ -43,6 +43,16 @@ function extLabel(name) {
   return m ? m[1].toUpperCase() : "ФОТО";
 }
 
+// Races a promise against a timer — if a network call (or anything else)
+// just hangs instead of failing outright (common on flaky mobile connections),
+// this forces it to give up after `ms` instead of stalling the whole batch.
+function withTimeout(promise, ms, label = "Операция") {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label}: превышено время ожидания`)), ms)),
+  ]);
+}
+
 // Large phone-camera originals (and especially "download original" files from
 // Google Photos) can be 10-20+ MB — decoding, base64-encoding and uploading
 // that full-size on a low-RAM phone is exactly what triggers "not enough
@@ -566,14 +576,21 @@ export default function DAlbom() {
   const cacheRemotePhotos = useCallback(async (loaded) => {
     const loadedIds = new Set(loaded.map((p) => p.id));
     const existingCache = await idbGetAll("photoCache");
+    const alreadyCached = new Set(existingCache.map((c) => c.id));
     for (const c of existingCache) if (!loadedIds.has(c.id)) idbDelete("photoCache", c.id);
-    for (const p of loaded) {
-      if (!p.url) continue;
+
+    // Only the photos we don't already have offline, newest first, and capped —
+    // re-downloading and re-encoding the whole album on every single app open
+    // (which is what was happening before) is exactly what was making things
+    // feel slow, and could leave later photos never cached at all on a weak phone.
+    const toCache = loaded.filter((p) => p.url && !alreadyCached.has(p.id)).slice(0, 60);
+
+    for (const p of toCache) {
       try {
-        const res = await fetch(p.url);
+        const res = await withTimeout(fetch(p.url), 15000, "Загрузка офлайн-копии");
         const blob = await res.blob();
         const dataUrl = await readAsDataURL(blob);
-        idbPut("photoCache", {
+        await idbPut("photoCache", {
           id: p.id,
           dataUrl,
           filePath: p.filePath,
@@ -588,6 +605,9 @@ export default function DAlbom() {
       } catch {
         // this one just won't be viewable offline until the next successful sync
       }
+      // yield to the main thread between photos so this background job never
+      // freezes scrolling/tapping while it works through a big batch
+      await new Promise((r) => setTimeout(r, 30));
     }
   }, []);
 
@@ -649,16 +669,32 @@ export default function DAlbom() {
         const blob = await blobRes.blob();
         const safeName = item.name.replace(/[^a-zA-Z0-9._-]/g, "_");
         const path = `${item.ownerId}/${item.uploadedAt}-${safeName}`;
-        await uploadToStorage(session.access_token, path, blob);
-        const row = await insertPhotoRow(session.access_token, {
-          uploaded_by: item.uploadedBy,
-          owner_id: item.ownerId,
-          file_path: path,
-          taken_at: item.takenAt,
+        await withTimeout(uploadToStorage(session.access_token, path, blob), 30000, "Загрузка в облако");
+        const row = await withTimeout(
+          insertPhotoRow(session.access_token, {
+            uploaded_by: item.uploadedBy,
+            owner_id: item.ownerId,
+            file_path: path,
+            taken_at: item.takenAt,
+            lat: item.lat,
+            lng: item.lng,
+          }),
+          15000,
+          "Сохранение записи"
+        );
+        await idbDelete("pendingUploads", item.id);
+        idbPut("photoCache", {
+          id: row.id,
+          dataUrl: item.dataUrl,
+          filePath: path,
+          name: item.name,
+          takenAt: item.takenAt,
+          hasExifDate: item.hasExifDate,
           lat: item.lat,
           lng: item.lng,
+          uploadedBy: item.uploadedBy,
+          ownerId: item.ownerId,
         });
-        await idbDelete("pendingUploads", item.id);
         setPhotos((prev) =>
           prev.map((p) => (p.id === item.id ? { ...p, id: row.id, filePath: path, pending: false, remote: true } : p))
         );
@@ -740,10 +776,10 @@ export default function DAlbom() {
           let uploadBlob = file;
           let uploadName = file.name;
           try {
-            uploadBlob = await resizeImage(file);
+            uploadBlob = await withTimeout(resizeImage(file), 15000, "Сжатие фото");
             uploadName = file.name.replace(/\.[a-zA-Z0-9]+$/, "") + ".jpg";
           } catch {
-            // couldn't decode/resize (e.g. HEIC) — fall back to the original file as-is
+            // couldn't decode/resize in time (e.g. HEIC, or a very heavy file) — use the original as-is
             uploadBlob = file;
             uploadName = file.name;
           }
@@ -811,18 +847,39 @@ export default function DAlbom() {
           try {
             const safeName = uploadName.replace(/[^a-zA-Z0-9._-]/g, "_");
             const path = `${myId}/${Date.now()}-${safeName}`;
-            await uploadToStorage(session.access_token, path, uploadBlob);
-            const row = await insertPhotoRow(session.access_token, {
-              uploaded_by: myLabel,
-              owner_id: myId,
-              file_path: path,
-              taken_at: takenAt.toISOString(),
-              lat: exif?.lat ?? null,
-              lng: exif?.lng ?? null,
-            });
+            await withTimeout(uploadToStorage(session.access_token, path, uploadBlob), 30000, "Загрузка в облако");
+            const row = await withTimeout(
+              insertPhotoRow(session.access_token, {
+                uploaded_by: myLabel,
+                owner_id: myId,
+                file_path: path,
+                taken_at: takenAt.toISOString(),
+                lat: exif?.lat ?? null,
+                lng: exif?.lng ?? null,
+              }),
+              15000,
+              "Сохранение записи"
+            );
             setPhotos((prev) =>
               prev.map((p) => (p.id === tempId ? { ...p, id: row.id, filePath: path, uploading: false, remote: true } : p))
             );
+            // we already have this exact photo decoded in memory (localUrl) —
+            // save it straight to the offline cache instead of downloading it
+            // back from the network a second time just to cache it
+            if (localUrl) {
+              idbPut("photoCache", {
+                id: row.id,
+                dataUrl: localUrl,
+                filePath: path,
+                name: uploadName,
+                takenAt: takenAt.toISOString(),
+                hasExifDate: !!exif?.takenAt,
+                lat: exif?.lat ?? null,
+                lng: exif?.lng ?? null,
+                uploadedBy: myLabel,
+                ownerId: myId,
+              });
+            }
             ok++;
           } catch (e) {
             setUploadError(e.message);
