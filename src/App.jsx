@@ -12,6 +12,7 @@ import {
   LogOut,
   WifiOff,
   CloudOff,
+  ChevronDown,
 } from "lucide-react";
 
 const SUPABASE_URL = "https://nynaypkgnnccjroypvyu.supabase.co";
@@ -479,6 +480,9 @@ export default function DAlbom() {
   const [pendingCount, setPendingCount] = useState(0);
   const [syncing, setSyncing] = useState(false);
   const [viewFilter, setViewFilter] = useState("all");
+  const [batchProgress, setBatchProgress] = useState(null); // {done, total} while a multi-select upload is running
+  const [batchSummary, setBatchSummary] = useState("");
+  const [collapsedDays, setCollapsedDays] = useState(() => new Set());
 
   useEffect(() => {
     const goOnline = () => setIsOnline(true);
@@ -535,7 +539,13 @@ export default function DAlbom() {
   const loadFromCache = useCallback(async () => {
     const cached = await idbGetAll("photoCache");
     const pending = await idbGetAll("pendingUploads");
-    const cachedPhotos = cached.map((c) => ({ ...c, takenAt: new Date(c.takenAt), remote: true }));
+    const cachedPhotos = cached.map((c) => ({
+      ...c,
+      url: c.dataUrl,
+      takenAt: new Date(c.takenAt),
+      remote: true,
+      previewFailed: !c.dataUrl,
+    }));
     const pendingPhotos = pending.map((p) => ({
       id: p.id,
       url: p.dataUrl,
@@ -711,104 +721,127 @@ export default function DAlbom() {
     async (fileList) => {
       if (!session?.access_token) return;
       const files = Array.from(fileList).filter((f) => f.type.startsWith("image/") || IMAGE_EXT_RE.test(f.name));
+      if (files.length === 0) return;
+
+      let ok = 0;
+      let failed = 0;
+      setBatchProgress({ done: 0, total: files.length });
+
       for (const file of files) {
-        let exif = null;
         try {
-          const buffer = await file.arrayBuffer();
-          exif = parseExif(buffer);
-        } catch {
-          exif = null;
-        }
+          let exif = null;
+          try {
+            const buffer = await file.arrayBuffer();
+            exif = parseExif(buffer);
+          } catch {
+            exif = null;
+          }
 
-        let uploadBlob = file;
-        let uploadName = file.name;
-        try {
-          uploadBlob = await resizeImage(file);
-          uploadName = file.name.replace(/\.[a-zA-Z0-9]+$/, "") + ".jpg";
-        } catch {
-          // couldn't decode/resize (e.g. HEIC) — fall back to the original file as-is
-          uploadBlob = file;
-          uploadName = file.name;
-        }
+          let uploadBlob = file;
+          let uploadName = file.name;
+          try {
+            uploadBlob = await resizeImage(file);
+            uploadName = file.name.replace(/\.[a-zA-Z0-9]+$/, "") + ".jpg";
+          } catch {
+            // couldn't decode/resize (e.g. HEIC) — fall back to the original file as-is
+            uploadBlob = file;
+            uploadName = file.name;
+          }
 
-        let localUrl = null;
-        try {
-          localUrl = await readAsDataURL(uploadBlob);
-        } catch {
-          localUrl = null;
-        }
+          let localUrl = null;
+          try {
+            localUrl = await readAsDataURL(uploadBlob);
+          } catch {
+            localUrl = null;
+          }
 
-        const takenAt = exif?.takenAt || new Date(file.lastModified);
-        const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+          const takenAt = exif?.takenAt || new Date(file.lastModified);
+          const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
-        if (!isOnline) {
-          const queued = {
-            id: tempId,
-            dataUrl: localUrl,
-            name: uploadName,
-            takenAt: takenAt.toISOString(),
-            uploadedAt: Date.now(),
-            hasExifDate: !!exif?.takenAt,
-            lat: exif?.lat ?? null,
-            lng: exif?.lng ?? null,
-            uploadedBy: myLabel,
-            ownerId: myId,
-          };
-          await idbPut("pendingUploads", queued);
-          setPendingCount((n) => n + 1);
-          setPhotos((prev) => [
-            {
+          if (!isOnline) {
+            const queued = {
               id: tempId,
-              url: localUrl,
+              dataUrl: localUrl,
               name: uploadName,
-              takenAt,
+              takenAt: takenAt.toISOString(),
+              uploadedAt: Date.now(),
               hasExifDate: !!exif?.takenAt,
               lat: exif?.lat ?? null,
               lng: exif?.lng ?? null,
               uploadedBy: myLabel,
               ownerId: myId,
-              previewFailed: !localUrl,
-              pending: true,
-            },
-            ...prev,
-          ]);
-          continue;
-        }
+            };
+            await idbPut("pendingUploads", queued);
+            setPendingCount((n) => n + 1);
+            setPhotos((prev) => [
+              {
+                id: tempId,
+                url: localUrl,
+                name: uploadName,
+                takenAt,
+                hasExifDate: !!exif?.takenAt,
+                lat: exif?.lat ?? null,
+                lng: exif?.lng ?? null,
+                uploadedBy: myLabel,
+                ownerId: myId,
+                previewFailed: !localUrl,
+                pending: true,
+              },
+              ...prev,
+            ]);
+            ok++;
+            continue;
+          }
 
-        const optimistic = {
-          id: tempId,
-          url: localUrl,
-          name: uploadName,
-          takenAt,
-          hasExifDate: !!exif?.takenAt,
-          lat: exif?.lat ?? null,
-          lng: exif?.lng ?? null,
-          uploadedBy: myLabel,
-          ownerId: myId,
-          previewFailed: !localUrl,
-          uploading: true,
-        };
-        setPhotos((prev) => [optimistic, ...prev]);
-
-        try {
-          const safeName = uploadName.replace(/[^a-zA-Z0-9._-]/g, "_");
-          const path = `${myId}/${Date.now()}-${safeName}`;
-          await uploadToStorage(session.access_token, path, uploadBlob);
-          const row = await insertPhotoRow(session.access_token, {
-            uploaded_by: myLabel,
-            owner_id: myId,
-            file_path: path,
-            taken_at: takenAt.toISOString(),
+          const optimistic = {
+            id: tempId,
+            url: localUrl,
+            name: uploadName,
+            takenAt,
+            hasExifDate: !!exif?.takenAt,
             lat: exif?.lat ?? null,
             lng: exif?.lng ?? null,
-          });
-          setPhotos((prev) =>
-            prev.map((p) => (p.id === tempId ? { ...p, id: row.id, filePath: path, uploading: false, remote: true } : p))
-          );
-        } catch (e) {
-          setUploadError(e.message);
-          setPhotos((prev) => prev.map((p) => (p.id === tempId ? { ...p, uploading: false, failed: true } : p)));
+            uploadedBy: myLabel,
+            ownerId: myId,
+            previewFailed: !localUrl,
+            uploading: true,
+          };
+          setPhotos((prev) => [optimistic, ...prev]);
+
+          try {
+            const safeName = uploadName.replace(/[^a-zA-Z0-9._-]/g, "_");
+            const path = `${myId}/${Date.now()}-${safeName}`;
+            await uploadToStorage(session.access_token, path, uploadBlob);
+            const row = await insertPhotoRow(session.access_token, {
+              uploaded_by: myLabel,
+              owner_id: myId,
+              file_path: path,
+              taken_at: takenAt.toISOString(),
+              lat: exif?.lat ?? null,
+              lng: exif?.lng ?? null,
+            });
+            setPhotos((prev) =>
+              prev.map((p) => (p.id === tempId ? { ...p, id: row.id, filePath: path, uploading: false, remote: true } : p))
+            );
+            ok++;
+          } catch (e) {
+            setUploadError(e.message);
+            setPhotos((prev) => prev.map((p) => (p.id === tempId ? { ...p, uploading: false, failed: true } : p)));
+            failed++;
+          }
+        } catch {
+          // whatever went wrong with this one file, it must never stop the rest of the batch
+          failed++;
+        } finally {
+          setBatchProgress((prev) => (prev ? { ...prev, done: prev.done + 1 } : null));
         }
+      }
+
+      setBatchProgress(null);
+      if (files.length > 1) {
+        setBatchSummary(
+          failed > 0 ? `Загружено ${ok} из ${files.length} — ${failed} не удалось` : `Загружено ${ok} из ${files.length}`
+        );
       }
     },
     [myId, myLabel, session, isOnline]
@@ -886,6 +919,40 @@ export default function DAlbom() {
   const lightboxIndex = orderedPhotos.findIndex((p) => p.id === lightboxId);
   const lightboxPhoto = lightboxIndex >= 0 ? orderedPhotos[lightboxIndex] : null;
   const showLightboxAt = (i) => { if (i >= 0 && i < orderedPhotos.length) setLightboxId(orderedPhotos[i].id); };
+
+  const [zoomed, setZoomed] = useState(false);
+  useEffect(() => setZoomed(false), [lightboxId]);
+  const touchStartRef = useRef(null);
+  const lastTapRef = useRef(0);
+
+  const handleLightboxTouchStart = (e) => {
+    if (e.touches.length === 1) {
+      touchStartRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY, time: Date.now() };
+    }
+  };
+  const handleLightboxTouchEnd = (e) => {
+    const start = touchStartRef.current;
+    touchStartRef.current = null;
+    if (!start) return;
+    const touch = e.changedTouches[0];
+    const dx = touch.clientX - start.x;
+    const dy = touch.clientY - start.y;
+    const dt = Date.now() - start.time;
+
+    if (!zoomed && Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5 && dt < 600) {
+      showLightboxAt(lightboxIndex + (dx < 0 ? 1 : -1));
+      return;
+    }
+    if (Math.abs(dx) < 10 && Math.abs(dy) < 10) {
+      const now = Date.now();
+      if (now - lastTapRef.current < 300) {
+        setZoomed((z) => !z);
+        lastTapRef.current = 0;
+      } else {
+        lastTapRef.current = now;
+      }
+    }
+  };
 
   const fontImports = (
     <style>{`
@@ -1058,6 +1125,21 @@ export default function DAlbom() {
         </div>
       </label>
 
+      {batchProgress && (
+        <div style={styles.progressBanner}>
+          Загружаем {batchProgress.done} из {batchProgress.total}...
+          <div style={styles.progressTrack}>
+            <div style={{ ...styles.progressFill, width: `${(batchProgress.done / batchProgress.total) * 100}%` }} />
+          </div>
+        </div>
+      )}
+
+      {!batchProgress && batchSummary && (
+        <div style={styles.summaryBanner} onClick={() => setBatchSummary("")}>
+          {batchSummary} (нажмите, чтобы скрыть)
+        </div>
+      )}
+
       {uploadError && (
         <div style={styles.errorBanner} onClick={() => setUploadError("")}>{uploadError} (нажмите, чтобы скрыть)</div>
       )}
@@ -1107,15 +1189,32 @@ export default function DAlbom() {
           sortedKeys.map((key) => {
             const dayPhotos = groups[key];
             const withLocation = dayPhotos.find((p) => p.lat != null);
+            const isCollapsed = collapsedDays.has(key);
             return (
               <section key={key} style={{ animation: "dalbFadeIn 0.4s ease" }}>
-                <div style={styles.dayHeader}>
+                <div
+                  style={{ ...styles.dayHeader, cursor: "pointer" }}
+                  onClick={() =>
+                    setCollapsedDays((prev) => {
+                      const next = new Set(prev);
+                      next.has(key) ? next.delete(key) : next.add(key);
+                      return next;
+                    })
+                  }
+                >
+                  <ChevronDown
+                    size={15}
+                    strokeWidth={2}
+                    style={{ color: "#a698b0", transform: isCollapsed ? "rotate(-90deg)" : "rotate(0deg)", transition: "transform 0.15s ease" }}
+                  />
                   <span style={styles.dayHeaderDate}>{formatDateHeader(dayPhotos[0].takenAt)}</span>
+                  <span style={{ fontSize: 11, color: "#6b5c78" }}>{dayPhotos.length}</span>
                   {withLocation && (
                     <span style={styles.dayHeaderPlace}><MapPin size={12} strokeWidth={2} />{formatCoords(withLocation.lat, withLocation.lng)}</span>
                   )}
                   {!dayPhotos[0].hasExifDate && <span style={styles.noExifTag}>по дате загрузки</span>}
                 </div>
+                {!isCollapsed && (
                 <div className="dalb-masonry">
                   {dayPhotos.map((photo) => {
                     const isMine = photo.ownerId === myId;
@@ -1143,6 +1242,7 @@ export default function DAlbom() {
                     );
                   })}
                 </div>
+                )}
               </section>
             );
           })
@@ -1162,7 +1262,16 @@ export default function DAlbom() {
             {lightboxPhoto.previewFailed || !lightboxPhoto.url ? (
               <div style={{ width: 320 }}><FallbackTile name={lightboxPhoto.name} big /></div>
             ) : (
-              <img src={lightboxPhoto.url} alt={lightboxPhoto.name} style={styles.lightboxImg} onError={() => markPreviewFailed(lightboxPhoto.id)} />
+              <div style={{ overflow: "hidden", maxWidth: "100%", maxHeight: "72vh", borderRadius: 12 }}>
+                <img
+                  src={lightboxPhoto.url}
+                  alt={lightboxPhoto.name}
+                  style={{ ...styles.lightboxImg, transform: zoomed ? "scale(2.2)" : "scale(1)", transition: "transform 0.2s ease", touchAction: "none" }}
+                  onError={() => markPreviewFailed(lightboxPhoto.id)}
+                  onTouchStart={handleLightboxTouchStart}
+                  onTouchEnd={handleLightboxTouchEnd}
+                />
+              </div>
             )}
             <div style={styles.lightboxMeta}>
               <span style={styles.lightboxDate}>{formatDateFull(lightboxPhoto.takenAt)}</span>
@@ -1173,6 +1282,7 @@ export default function DAlbom() {
                 <span style={{ ...styles.avatarDotInline, background: colorForName(lightboxPhoto.uploadedBy || "") }} />
                 {lightboxPhoto.uploadedBy === myLabel ? "Вы" : displayName(lightboxPhoto.uploadedBy)}
               </span>
+              <span style={{ fontSize: 10.5, color: "#6b5c78" }}>· смахните для след. · 2 тапа — приблизить</span>
               {lightboxPhoto.ownerId === myId && (
                 <button
                   className="dalb-pill"
@@ -1211,6 +1321,10 @@ const styles = {
   dropTitle: { fontSize: 14, fontWeight: 500, color: "#f3ecf5" },
   dropSub: { fontSize: 12.5, color: "#a698b0", marginTop: 2 },
   errorBanner: { position: "relative", zIndex: 1, background: "rgba(255,111,181,0.12)", border: "1px solid rgba(255,111,181,0.3)", color: "#ff9ecb", padding: "8px 14px", borderRadius: 10, fontSize: 12.5, cursor: "pointer" },
+  progressBanner: { position: "relative", zIndex: 1, background: "#251c2e", border: "1px solid #3d2f49", color: "#c9bdd2", padding: "10px 14px", borderRadius: 10, fontSize: 12.5, display: "flex", flexDirection: "column", gap: 6 },
+  progressTrack: { height: 4, borderRadius: 999, background: "#3d2f49", overflow: "hidden" },
+  progressFill: { height: "100%", background: "linear-gradient(90deg, #ff9ecb, #c9a4fb)", transition: "width 0.2s ease" },
+  summaryBanner: { position: "relative", zIndex: 1, background: "rgba(94,234,212,0.1)", border: "1px solid rgba(94,234,212,0.3)", color: "#8fe0c4", padding: "8px 14px", borderRadius: 10, fontSize: 12.5, cursor: "pointer" },
   body: { flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 28, position: "relative", zIndex: 1 },
   empty: { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8, padding: "70px 0", color: "#6b5c78" },
   emptyTitle: { fontFamily: "'Fraunces', serif", fontSize: 18, color: "#a698b0" },
