@@ -1166,7 +1166,7 @@ export default function DAlbom() {
         <input
           ref={fileInputRef}
           type="file"
-          accept="image/*,.heic,.heif"
+          accept="image/*,.heic,.heif,android/allowCamera"
           multiple
           onClick={(e) => { e.target.value = ""; }}
           style={{ position: "absolute", width: 1, height: 1, opacity: 0 }}
