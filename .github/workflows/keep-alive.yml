@@ -2,15 +2,17 @@ name: Keep Supabase Alive
 
 on:
   schedule:
-    # Запуск каждые 3 дня в 00:00
-    - cron: '0 0 */3 * *'
+    # Запуск каждые 2 дня в 00:00 (UTC)
+    - cron: '0 0 */2 * *'
   workflow_dispatch:
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Supabase REST API
+      - name: Ping Supabase database (real query)
         run: |
-          curl -i -X GET 'https://nynaypkgnnccjroypvyu.supabase.co/rest/v1/' \
-          -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}"
+          curl --fail --show-error --silent -i \
+            'https://nynaypkgnnccjroypvyu.supabase.co/rest/v1/photos?select=id&limit=1' \
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}"
